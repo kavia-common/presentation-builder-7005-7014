@@ -2,6 +2,11 @@
  * Download helper:
  * - If same-origin path or mock, create a Blob and trigger download.
  * - If cross-origin, try fetch->blob (if CORS allows) else open new tab.
+ *
+ * Hardened to:
+ * - validate Response-like objects
+ * - handle non-2xx with readable server messages
+ * - detect unexpected content-types (HTML/JSON error pages) before saving as .pptx
  */
 
 function isHttpUrl(url) {
@@ -19,6 +24,28 @@ function isSameOrigin(url) {
   }
 }
 
+function isResponseLike(obj) {
+  return (
+    obj &&
+    typeof obj === "object" &&
+    typeof obj.ok === "boolean" &&
+    typeof obj.status === "number" &&
+    typeof obj.headers === "object" &&
+    typeof obj.blob === "function" &&
+    typeof obj.text === "function"
+  );
+}
+
+function getHeader(res, name) {
+  try {
+    if (res?.headers?.get) return res.headers.get(name) || "";
+    const key = Object.keys(res?.headers || {}).find((k) => k.toLowerCase() === name.toLowerCase());
+    return key ? String(res.headers[key]) : "";
+  } catch {
+    return "";
+  }
+}
+
 function triggerBlobDownload(blob, filename) {
   const blobUrl = window.URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -30,20 +57,69 @@ function triggerBlobDownload(blob, filename) {
   window.URL.revokeObjectURL(blobUrl);
 }
 
+async function safeReadText(res) {
+  try {
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
+
+function looksLikePptxContentType(ct) {
+  const v = (ct || "").toLowerCase();
+  return (
+    v.includes("application/vnd.openxmlformats-officedocument.presentationml.presentation") ||
+    v.includes("application/octet-stream")
+  );
+}
+
 async function fetchAsBlob(url) {
   let res;
   try {
     res = await fetch(url, { method: "GET" });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(msg || "Download failed due to a network error.");
+    throw new Error(
+      [
+        "Download failed due to a network error.",
+        msg ? `Details: ${msg}` : "",
+        "If this is cross-origin, ensure the backend enables CORS for file downloads.",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
   }
 
-  if (!res || typeof res.ok !== "boolean") {
-    throw new Error("Download failed: unexpected response object.");
+  if (!isResponseLike(res)) {
+    throw new Error(
+      "Download failed: the network layer returned an unexpected response object. This may be caused by a proxy/service worker or a non-standard fetch implementation."
+    );
   }
 
-  if (!res.ok) throw new Error(`Download failed (HTTP ${res.status})`);
+  if (!res.ok) {
+    const text = await safeReadText(res);
+    const snippet = text ? text.slice(0, 280) : "";
+    throw new Error(
+      [`Download failed (HTTP ${res.status}).`, snippet ? `Server says: ${snippet}` : ""].filter(Boolean).join(" ")
+    );
+  }
+
+  // Detect common "success but actually an error page" scenarios.
+  const contentType = getHeader(res, "content-type");
+  if (contentType && !looksLikePptxContentType(contentType)) {
+    const text = await safeReadText(res);
+    const snippet = text ? text.slice(0, 280) : "";
+    throw new Error(
+      [
+        "Download failed: server returned an unexpected content-type instead of a .pptx file.",
+        `content-type: ${contentType}.`,
+        snippet ? `Body: ${snippet}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
+  }
+
   return res.blob();
 }
 
@@ -78,6 +154,7 @@ export async function downloadPresentation(downloadUrl, filename = "generated_pr
     const blob = await fetchAsBlob(downloadUrl);
     triggerBlobDownload(blob, filename);
   } catch (e) {
+    // If CORS blocks fetch, opening the direct URL is often the best fallback.
     window.open(downloadUrl, "_blank", "noopener,noreferrer");
   }
 }

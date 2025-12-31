@@ -8,22 +8,149 @@ import { getApiBaseUrl, isMockMode } from "../utils/env";
 const MOCK_JOBS = new Map();
 
 /**
- * A very small fetch wrapper that ensures we never attempt to access `.ok`
- * on an undefined/non-Response value (e.g., when fetch throws).
+ * Response-like detection:
+ * Some runtimes/proxies/service workers can return objects that are not real `Response` instances,
+ * but still implement the same interface surface. We accept "Response-like" objects, but reject
+ * anything without the minimum fields we depend on.
+ */
+function isResponseLike(obj) {
+  return (
+    obj &&
+    typeof obj === "object" &&
+    typeof obj.ok === "boolean" &&
+    typeof obj.status === "number" &&
+    typeof obj.headers === "object" &&
+    typeof obj.text === "function"
+  );
+}
+
+function getHeader(res, name) {
+  try {
+    // Headers instance
+    if (res?.headers?.get) return res.headers.get(name) || "";
+    // plain object fallback
+    const key = Object.keys(res?.headers || {}).find((k) => k.toLowerCase() === name.toLowerCase());
+    return key ? String(res.headers[key]) : "";
+  } catch {
+    return "";
+  }
+}
+
+function isProbablyJson(contentType) {
+  const ct = (contentType || "").toLowerCase();
+  return ct.includes("application/json") || ct.includes("+json");
+}
+
+/**
+ * Convert unknown thrown values into a stable Error message.
+ */
+function toErrorMessage(e) {
+  if (e instanceof Error) return e.message;
+  try {
+    return typeof e === "string" ? e : JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
+/**
+ * Build an actionable hint for common misconfiguration/network issues.
+ */
+function buildConfigHint() {
+  const base = getApiBaseUrl();
+  if (!base) {
+    return "No API base URL is configured. Either enable mock mode by leaving it blank, or set REACT_APP_API_BASE / REACT_APP_BACKEND_URL to your backend (e.g. http://localhost:8000).";
+  }
+  return `Configured API base URL: ${base}. If this is wrong, update REACT_APP_API_BASE / REACT_APP_BACKEND_URL and restart the dev server.`;
+}
+
+/**
+ * A fetch wrapper that:
+ * - never assumes fetch returned a valid Response
+ * - provides actionable errors for bad/missing base URLs, CORS, proxy issues, etc.
  */
 async function safeFetch(url, options) {
+  // Catch empty/invalid URL early with a better error message.
+  if (!url || typeof url !== "string") {
+    throw new Error(`Network request could not be started: invalid URL. ${buildConfigHint()}`);
+  }
+
+  let res;
   try {
-    const res = await fetch(url, options);
-
-    // Guard: in some environments/mocks, fetch may be polyfilled incorrectly.
-    if (!res || typeof res.ok !== "boolean") {
-      throw new Error("Network request returned an unexpected response object.");
-    }
-
-    return res;
+    res = await fetch(url, options);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(msg || "Network request failed.");
+    const msg = toErrorMessage(e);
+    throw new Error(
+      [
+        "Network request failed.",
+        msg ? `Details: ${msg}` : "",
+        buildConfigHint(),
+        "Also check: backend is running, URL is reachable, and CORS allows the frontend origin.",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
+  }
+
+  if (!isResponseLike(res)) {
+    throw new Error(
+      [
+        "Network request returned an unexpected response object.",
+        buildConfigHint(),
+        "This can happen with misconfigured proxies/service workers, CORS blocks, or a non-standard fetch polyfill.",
+      ].join(" ")
+    );
+  }
+
+  return res;
+}
+
+/**
+ * Read error body text safely (never throw).
+ */
+async function safeReadText(res) {
+  try {
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Try to parse JSON only when the server claims it's JSON.
+ * If parsing fails, return { ok:false, ... } with helpful context.
+ */
+async function safeReadJson(res, { expected = "json" } = {}) {
+  const contentType = getHeader(res, "content-type");
+  const bodyText = await safeReadText(res);
+
+  if (!isProbablyJson(contentType)) {
+    // Backend might return HTML error pages (reverse proxy) or plain text.
+    const snippet = bodyText ? bodyText.slice(0, 280) : "";
+    throw new Error(
+      [
+        `Unexpected content-type from server (expected ${expected}).`,
+        contentType ? `Received: ${contentType}.` : "No content-type header.",
+        snippet ? `Body: ${snippet}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
+  }
+
+  try {
+    return JSON.parse(bodyText || "{}");
+  } catch {
+    const snippet = bodyText ? bodyText.slice(0, 280) : "";
+    throw new Error(
+      [
+        "Server returned malformed JSON.",
+        contentType ? `content-type: ${contentType}.` : "",
+        snippet ? `Body: ${snippet}` : "",
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
   }
 }
 
@@ -57,10 +184,21 @@ async function submitGenerationReal(payload) {
   });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || `Failed to submit generation (HTTP ${res.status})`);
+    const text = await safeReadText(res);
+    const snippet = text ? text.slice(0, 280) : "";
+    throw new Error(
+      [
+        `Failed to submit generation (HTTP ${res.status}).`,
+        snippet ? `Server says: ${snippet}` : "",
+        buildConfigHint(),
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
   }
-  return res.json();
+
+  // Success path: still validate content-type to avoid "unexpected response object" follow-up errors
+  return safeReadJson(res, { expected: "application/json" });
 }
 
 async function getStatusReal(jobId) {
@@ -70,10 +208,20 @@ async function getStatusReal(jobId) {
   const res = await safeFetch(url, { method: "GET" });
 
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || `Failed to get status (HTTP ${res.status})`);
+    const text = await safeReadText(res);
+    const snippet = text ? text.slice(0, 280) : "";
+    throw new Error(
+      [
+        `Failed to get status (HTTP ${res.status}).`,
+        snippet ? `Server says: ${snippet}` : "",
+        buildConfigHint(),
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
   }
-  return res.json();
+
+  return safeReadJson(res, { expected: "application/json" });
 }
 
 function initMockJob(jobId) {
@@ -100,7 +248,9 @@ function computeMockStatus(jobId) {
     };
   }
   const t = Date.now();
-  const next = job.timeline.findLast ? job.timeline.findLast((e) => e.at <= t) : job.timeline.filter((e) => e.at <= t).slice(-1)[0];
+  const next = job.timeline.findLast
+    ? job.timeline.findLast((e) => e.at <= t)
+    : job.timeline.filter((e) => e.at <= t).slice(-1)[0];
 
   if (!next) {
     return { status: "queued", progress: 0 };

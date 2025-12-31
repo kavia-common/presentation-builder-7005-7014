@@ -3,6 +3,7 @@ import Topbar from "../components/Topbar";
 import ContentArea from "../components/ContentArea";
 import ProgressBar from "../components/ProgressBar";
 import { submitGeneration, getStatus } from "../api/client";
+import { getApiBaseUrl, isMockMode } from "../utils/env";
 import { parseSectionsToSlides } from "../utils/parseSections";
 import { downloadPresentation } from "../utils/download";
 import { useToasts } from "../context/ToastContext";
@@ -23,6 +24,12 @@ function validate({ title, sections }) {
   if (!title.trim()) errs.title = "Presentation title is required.";
   if (!sections.trim()) errs.sections = "Please enter at least one section/bullet.";
   return errs;
+}
+
+function withConfigHint(message) {
+  const base = getApiBaseUrl();
+  if (isMockMode()) return message;
+  return `${message} (API base: ${base || "not set"}). If the backend is down or the URL is wrong, update REACT_APP_API_BASE / REACT_APP_BACKEND_URL and restart the dev server.`;
 }
 
 // PUBLIC_INTERFACE
@@ -97,8 +104,9 @@ export default function Generate() {
       } catch (e) {
         setIsGenerating(false);
         const msg = e instanceof Error ? e.message : "Failed to get job status.";
-        setInlineError(msg);
-        toasts.error("Status check failed", msg);
+        const hinted = withConfigHint(msg);
+        setInlineError(hinted);
+        toasts.error("Status check failed", hinted);
         if (pollTimerRef.current) {
           clearInterval(pollTimerRef.current);
           pollTimerRef.current = null;
@@ -160,9 +168,10 @@ export default function Generate() {
     } catch (err) {
       setIsGenerating(false);
       const msg = err instanceof Error ? err.message : "Generation failed.";
-      setInlineError(msg);
+      const hinted = withConfigHint(msg);
+      setInlineError(hinted);
       setStatusText("Error.");
-      toasts.error("Generation failed", msg);
+      toasts.error("Generation failed", hinted);
     }
   }
 
