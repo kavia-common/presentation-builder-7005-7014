@@ -3,11 +3,15 @@ import Topbar from "../components/Topbar";
 import ContentArea from "../components/ContentArea";
 import { getApiBaseUrl, getWsUrl } from "../utils/env";
 import { getForceMock, setForceMock } from "../utils/mockMode";
+import { useToasts } from "../context/ToastContext";
+import { downloadSelfTestPptx } from "../utils/download";
 
 // PUBLIC_INTERFACE
 export default function Settings() {
   /** Basic settings page: shows configured env URLs, effective mode, and allows force-mock override. */
+  const toasts = useToasts();
   const [forceMock, setForceMockState] = useState(getForceMock());
+  const [isSelfTesting, setIsSelfTesting] = useState(false);
 
   useEffect(() => {
     setForceMockState(getForceMock());
@@ -31,6 +35,22 @@ export default function Settings() {
   function onToggleForceMock(next) {
     setForceMock(next);
     setForceMockState(next);
+  }
+
+  async function onDownloadSelfTest() {
+    setIsSelfTesting(true);
+    try {
+      await downloadSelfTestPptx({ filenamePrefix: "download-self-test" });
+      toasts.success(
+        "Self-test started",
+        "A small .pptx file should download now. If nothing happens, check browser download settings or popup blockers."
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Self-test failed.";
+      toasts.error("Self-test failed", msg);
+    } finally {
+      setIsSelfTesting(false);
+    }
   }
 
   return (
@@ -57,8 +77,9 @@ export default function Settings() {
             <div className="formRow">
               <label>Mock mode (env)</label>
               <div className="helpText">
-                <strong>{info.envMock}</strong> — env mock mode is used when <span className="kbd">REACT_APP_API_BASE</span>{" "}
-                and <span className="kbd">REACT_APP_BACKEND_URL</span> are not set.
+                <strong>{info.envMock}</strong> — env mock mode is used when{" "}
+                <span className="kbd">REACT_APP_API_BASE</span> and{" "}
+                <span className="kbd">REACT_APP_BACKEND_URL</span> are not set.
               </div>
             </div>
 
@@ -86,6 +107,23 @@ export default function Settings() {
                 <strong>{info.effectiveMock}</strong>
               </div>
             </div>
+
+            <div className="formRow">
+              <label>Download self-test</label>
+              <div className="helpText">
+                Verifies that your browser can download <span className="kbd">.pptx</span> files (independent of backend/CORS).
+              </div>
+              <div className="actionsRow" style={{ marginTop: 8 }}>
+                <button
+                  className="btn btnSecondary"
+                  type="button"
+                  onClick={onDownloadSelfTest}
+                  disabled={isSelfTesting}
+                >
+                  {isSelfTesting ? "Testing…" : "Run download self-test"}
+                </button>
+              </div>
+            </div>
           </div>
 
           <div className="card">
@@ -102,8 +140,8 @@ export default function Settings() {
               <span className="kbd">http://localhost:8000</span>).
               <br />
               <br />
-              If you see network/CORS/proxy errors, enable <strong>Force mock mode</strong> to continue using the app while you fix
-              the backend URL and restart the dev server.
+              If downloads fail due to CORS/proxy issues, either fix CORS on the backend or enable <strong>Force mock mode</strong>{" "}
+              to keep using the app.
             </div>
           </div>
         </div>

@@ -96,6 +96,7 @@ export default function Generate() {
 
         if (s.status === "error") {
           setIsGenerating(false);
+          setDownloadUrl("");
           setInlineError(s.errorMessage || "Generation failed.");
           toasts.error("Generation failed", s.errorMessage || "Please try again.");
           clearInterval(pollTimerRef.current);
@@ -103,6 +104,7 @@ export default function Generate() {
         }
       } catch (e) {
         setIsGenerating(false);
+        setDownloadUrl("");
         const msg = e instanceof Error ? e.message : "Failed to get job status.";
         const hinted = withConfigHint(msg);
         setInlineError(hinted);
@@ -202,6 +204,7 @@ export default function Generate() {
   }
 
   const disabled = isGenerating;
+  const canDownload = Boolean(downloadUrl) && !isGenerating;
 
   return (
     <>
@@ -337,10 +340,21 @@ export default function Generate() {
                   Reset
                 </button>
 
-                {downloadUrl ? (
-                  <button className="btn btnLink" type="button" onClick={onDownload}>
-                    Download .pptx
-                  </button>
+                <button
+                  className="btn btnLink"
+                  type="button"
+                  onClick={onDownload}
+                  disabled={!canDownload}
+                  aria-disabled={!canDownload}
+                  title={!downloadUrl ? "Generate a presentation first." : undefined}
+                >
+                  Download .pptx
+                </button>
+
+                {!downloadUrl ? (
+                  <div className="helpText" style={{ marginLeft: 4 }}>
+                    No file ready yet. If your backend is misconfigured (CORS/proxy), try Settings → Force mock mode.
+                  </div>
                 ) : null}
               </div>
             </form>
