@@ -1,8 +1,19 @@
-import { render, screen } from '@testing-library/react';
-import App from './App';
+import { render, screen } from "@testing-library/react";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
+import { ThemeProvider } from "./context/ThemeContext";
+import { ToastProvider } from "./context/ToastContext";
 
-test('renders learn react link', () => {
-  render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+test("renders generate view title", () => {
+  render(
+    <ThemeProvider>
+      <ToastProvider>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </ToastProvider>
+    </ThemeProvider>
+  );
+
+  expect(screen.getByText(/Generate Presentation/i)).toBeInTheDocument();
 });
