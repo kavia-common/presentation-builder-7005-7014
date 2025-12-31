@@ -8,6 +8,26 @@ import { getApiBaseUrl, isMockMode } from "../utils/env";
 const MOCK_JOBS = new Map();
 
 /**
+ * A very small fetch wrapper that ensures we never attempt to access `.ok`
+ * on an undefined/non-Response value (e.g., when fetch throws).
+ */
+async function safeFetch(url, options) {
+  try {
+    const res = await fetch(url, options);
+
+    // Guard: in some environments/mocks, fetch may be polyfilled incorrectly.
+    if (!res || typeof res.ok !== "boolean") {
+      throw new Error("Network request returned an unexpected response object.");
+    }
+
+    return res;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(msg || "Network request failed.");
+  }
+}
+
+/**
  * Emit one-line warning in development when mock mode is used.
  * (Requirement: log a one-line warning in dev when both API_BASE and BACKEND_URL are missing)
  */
@@ -28,7 +48,9 @@ function createJobId() {
 
 async function submitGenerationReal(payload) {
   const base = getApiBaseUrl();
-  const res = await fetch(`${base.replace(/\/$/, "")}/generate`, {
+  const url = `${base.replace(/\/$/, "")}/generate`;
+
+  const res = await safeFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -43,9 +65,9 @@ async function submitGenerationReal(payload) {
 
 async function getStatusReal(jobId) {
   const base = getApiBaseUrl();
-  const res = await fetch(`${base.replace(/\/$/, "")}/status/${encodeURIComponent(jobId)}`, {
-    method: "GET",
-  });
+  const url = `${base.replace(/\/$/, "")}/status/${encodeURIComponent(jobId)}`;
+
+  const res = await safeFetch(url, { method: "GET" });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");

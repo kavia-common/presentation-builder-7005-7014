@@ -31,7 +31,18 @@ function triggerBlobDownload(blob, filename) {
 }
 
 async function fetchAsBlob(url) {
-  const res = await fetch(url, { method: "GET" });
+  let res;
+  try {
+    res = await fetch(url, { method: "GET" });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(msg || "Download failed due to a network error.");
+  }
+
+  if (!res || typeof res.ok !== "boolean") {
+    throw new Error("Download failed: unexpected response object.");
+  }
+
   if (!res.ok) throw new Error(`Download failed (HTTP ${res.status})`);
   return res.blob();
 }
