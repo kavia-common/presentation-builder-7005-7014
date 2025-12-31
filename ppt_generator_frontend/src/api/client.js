@@ -1,17 +1,18 @@
-import { getApiBaseUrl, isMockMode } from "../utils/env";
+import { getApiBaseUrl } from "../utils/env";
+import { isMockForced, setForceMock } from "../utils/mockMode";
 
 /**
  * API adapter for PPT generation.
- * In mock mode it simulates an async job with incremental progress.
+ * - Uses backend API when configured and healthy
+ * - Falls back to mock mode automatically when backend is unreachable or returns unusable responses
+ * - Allows user override via Settings -> "Force mock mode"
  */
 
 const MOCK_JOBS = new Map();
 
 /**
- * Response-like detection:
- * Some runtimes/proxies/service workers can return objects that are not real `Response` instances,
- * but still implement the same interface surface. We accept "Response-like" objects, but reject
- * anything without the minimum fields we depend on.
+ * Some runtimes/proxies/service workers can return objects that are not real `Response` instances.
+ * We accept "Response-like" objects, but reject anything without the minimum fields we depend on.
  */
 function isResponseLike(obj) {
   return (
@@ -36,9 +37,14 @@ function getHeader(res, name) {
   }
 }
 
-function isProbablyJson(contentType) {
+function isAllowedJsonContentType(contentType) {
   const ct = (contentType || "").toLowerCase();
   return ct.includes("application/json") || ct.includes("+json");
+}
+
+function isHtmlLikeContentType(contentType) {
+  const ct = (contentType || "").toLowerCase();
+  return ct.includes("text/html") || ct.includes("application/xhtml") || ct.includes("text/plain");
 }
 
 /**
@@ -65,12 +71,76 @@ function buildConfigHint() {
 }
 
 /**
+ * Classify common "backend unusable" scenarios (CORS/proxy/service-worker HTML fallbacks).
+ * If true, the app should proceed with mock mode so users can keep working.
+ */
+function isBackendUnusableErrorMessage(message) {
+  const m = (message || "").toLowerCase();
+  return (
+    m.includes("failed to fetch") ||
+    m.includes("network request failed") ||
+    m.includes("load failed") ||
+    m.includes("net::err") ||
+    m.includes("cors") ||
+    m.includes("unexpected content-type") ||
+    m.includes("malformed json") ||
+    m.includes("unexpected response object") ||
+    m.includes("opaque response") ||
+    m.includes("opaqueredirect") ||
+    m.includes("blocked by client")
+  );
+}
+
+/**
+ * A small toast hook so api/client can surface concise fallback messages without changing UX.
+ * Registered from App-level.
+ */
+let toastAdapter = null;
+
+// PUBLIC_INTERFACE
+export function setApiClientToastAdapter(adapter) {
+  /**
+   * Register toast callbacks for the API client.
+   * @param {{info?:(title:string,message:string)=>void, error?:(title:string,message:string)=>void}} adapter
+   */
+  toastAdapter = adapter || null;
+}
+
+let didShowAutoFallbackToast = false;
+function maybeToastAutoFallback(reasonMessage) {
+  if (didShowAutoFallbackToast) return;
+  didShowAutoFallbackToast = true;
+
+  const base = getApiBaseUrl();
+  if (!base) return;
+
+  // Keep it concise, but actionable: show base URL + "update env + restart"
+  const msg = [
+    `Backend unreachable/unusable; continuing in mock mode.`,
+    `API base: ${base}.`,
+    `If this is wrong, update REACT_APP_API_BASE / REACT_APP_BACKEND_URL and restart the dev server.`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  if (toastAdapter?.info) toastAdapter.info("Using mock mode", msg);
+  // Also log for debugging.
+  if (process.env.NODE_ENV !== "production") {
+    // eslint-disable-next-line no-console
+    console.warn("[ppt-generator] auto-fallback to mock mode:", reasonMessage);
+  }
+}
+
+function shouldUseMock() {
+  return isMockForced() || !getApiBaseUrl();
+}
+
+/**
  * A fetch wrapper that:
  * - never assumes fetch returned a valid Response
- * - provides actionable errors for bad/missing base URLs, CORS, proxy issues, etc.
+ * - detects "opaque" responses (common with CORS/service workers) as unusable
  */
 async function safeFetch(url, options) {
-  // Catch empty/invalid URL early with a better error message.
   if (!url || typeof url !== "string") {
     throw new Error(`Network request could not be started: invalid URL. ${buildConfigHint()}`);
   }
@@ -102,6 +172,19 @@ async function safeFetch(url, options) {
     );
   }
 
+  // If CORS blocks, some browsers return an opaque response where you can't read headers/body.
+  // Treat this as unusable so we can fall back to mock mode.
+  const type = String(res.type || "");
+  if (type === "opaque" || type === "opaqueredirect") {
+    throw new Error(
+      [
+        `Opaque response received (type=${type}).`,
+        "This commonly indicates CORS/service-worker/proxy interference.",
+        buildConfigHint(),
+      ].join(" ")
+    );
+  }
+
   return res;
 }
 
@@ -117,20 +200,26 @@ async function safeReadText(res) {
 }
 
 /**
- * Try to parse JSON only when the server claims it's JSON.
- * If parsing fails, return { ok:false, ... } with helpful context.
+ * Read JSON with explicit allowlist and safe/snippet errors.
+ * - Requires JSON content-type
+ * - Handles HTML/proxy error pages gracefully
  */
-async function safeReadJson(res, { expected = "json" } = {}) {
+async function safeReadJson(res, { expected = "application/json" } = {}) {
   const contentType = getHeader(res, "content-type");
   const bodyText = await safeReadText(res);
 
-  if (!isProbablyJson(contentType)) {
-    // Backend might return HTML error pages (reverse proxy) or plain text.
+  if (!isAllowedJsonContentType(contentType)) {
     const snippet = bodyText ? bodyText.slice(0, 280) : "";
+    const extra =
+      isHtmlLikeContentType(contentType) || (snippet && snippet.trim().startsWith("<"))
+        ? "It looks like an HTML page (often a proxy error or service worker fallback)."
+        : "";
+
     throw new Error(
       [
         `Unexpected content-type from server (expected ${expected}).`,
         contentType ? `Received: ${contentType}.` : "No content-type header.",
+        extra,
         snippet ? `Body: ${snippet}` : "",
       ]
         .filter(Boolean)
@@ -143,11 +232,7 @@ async function safeReadJson(res, { expected = "json" } = {}) {
   } catch {
     const snippet = bodyText ? bodyText.slice(0, 280) : "";
     throw new Error(
-      [
-        "Server returned malformed JSON.",
-        contentType ? `content-type: ${contentType}.` : "",
-        snippet ? `Body: ${snippet}` : "",
-      ]
+      ["Server returned malformed JSON.", contentType ? `content-type: ${contentType}.` : "", snippet ? `Body: ${snippet}` : ""]
         .filter(Boolean)
         .join(" ")
     );
@@ -155,11 +240,10 @@ async function safeReadJson(res, { expected = "json" } = {}) {
 }
 
 /**
- * Emit one-line warning in development when mock mode is used.
- * (Requirement: log a one-line warning in dev when both API_BASE and BACKEND_URL are missing)
+ * Emit one-line warning in development when env-based mock mode is used.
  */
 (function warnIfMock() {
-  if (process.env.NODE_ENV !== "production" && isMockMode()) {
+  if (process.env.NODE_ENV !== "production" && !getApiBaseUrl()) {
     // eslint-disable-next-line no-console
     console.warn("[ppt-generator] API base URL missing; using mock mode.");
   }
@@ -171,57 +255,6 @@ function sleep(ms) {
 
 function createJobId() {
   return `job_${Math.random().toString(16).slice(2)}_${Date.now()}`;
-}
-
-async function submitGenerationReal(payload) {
-  const base = getApiBaseUrl();
-  const url = `${base.replace(/\/$/, "")}/generate`;
-
-  const res = await safeFetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    const text = await safeReadText(res);
-    const snippet = text ? text.slice(0, 280) : "";
-    throw new Error(
-      [
-        `Failed to submit generation (HTTP ${res.status}).`,
-        snippet ? `Server says: ${snippet}` : "",
-        buildConfigHint(),
-      ]
-        .filter(Boolean)
-        .join(" ")
-    );
-  }
-
-  // Success path: still validate content-type to avoid "unexpected response object" follow-up errors
-  return safeReadJson(res, { expected: "application/json" });
-}
-
-async function getStatusReal(jobId) {
-  const base = getApiBaseUrl();
-  const url = `${base.replace(/\/$/, "")}/status/${encodeURIComponent(jobId)}`;
-
-  const res = await safeFetch(url, { method: "GET" });
-
-  if (!res.ok) {
-    const text = await safeReadText(res);
-    const snippet = text ? text.slice(0, 280) : "";
-    throw new Error(
-      [
-        `Failed to get status (HTTP ${res.status}).`,
-        snippet ? `Server says: ${snippet}` : "",
-        buildConfigHint(),
-      ]
-        .filter(Boolean)
-        .join(" ")
-    );
-  }
-
-  return safeReadJson(res, { expected: "application/json" });
 }
 
 function initMockJob(jobId) {
@@ -248,9 +281,7 @@ function computeMockStatus(jobId) {
     };
   }
   const t = Date.now();
-  const next = job.timeline.findLast
-    ? job.timeline.findLast((e) => e.at <= t)
-    : job.timeline.filter((e) => e.at <= t).slice(-1)[0];
+  const next = job.timeline.findLast ? job.timeline.findLast((e) => e.at <= t) : job.timeline.filter((e) => e.at <= t).slice(-1)[0];
 
   if (!next) {
     return { status: "queued", progress: 0 };
@@ -263,6 +294,69 @@ function computeMockStatus(jobId) {
   };
 }
 
+async function submitGenerationReal(payload) {
+  const base = getApiBaseUrl();
+  const url = `${base.replace(/\/$/, "")}/generate`;
+
+  const res = await safeFetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const text = await safeReadText(res);
+    const snippet = text ? text.slice(0, 280) : "";
+    throw new Error(
+      [`Failed to submit generation (HTTP ${res.status}).`, snippet ? `Server says: ${snippet}` : "", buildConfigHint()]
+        .filter(Boolean)
+        .join(" ")
+    );
+  }
+
+  return safeReadJson(res, { expected: "application/json" });
+}
+
+async function getStatusReal(jobId) {
+  const base = getApiBaseUrl();
+  const url = `${base.replace(/\/$/, "")}/status/${encodeURIComponent(jobId)}`;
+
+  const res = await safeFetch(url, { method: "GET" });
+
+  if (!res.ok) {
+    const text = await safeReadText(res);
+    const snippet = text ? text.slice(0, 280) : "";
+    throw new Error(
+      [`Failed to get status (HTTP ${res.status}).`, snippet ? `Server says: ${snippet}` : "", buildConfigHint()]
+        .filter(Boolean)
+        .join(" ")
+    );
+  }
+
+  return safeReadJson(res, { expected: "application/json" });
+}
+
+/**
+ * Run an API call but fall back to mock mode if the backend is unreachable/unusable.
+ * This intentionally persists force-mock so subsequent calls (polling) keep working.
+ */
+async function withAutoMockFallback(realCall, mockCall) {
+  if (shouldUseMock()) return mockCall();
+
+  try {
+    return await realCall();
+  } catch (e) {
+    const msg = toErrorMessage(e);
+    if (isBackendUnusableErrorMessage(msg)) {
+      // Persist fallback so the whole flow continues (submit + poll) without breaking.
+      setForceMock(true);
+      maybeToastAutoFallback(msg);
+      return mockCall();
+    }
+    throw e;
+  }
+}
+
 // PUBLIC_INTERFACE
 export async function submitGeneration(payload) {
   /**
@@ -270,17 +364,19 @@ export async function submitGeneration(payload) {
    * @param {object} payload - Generation payload.
    * @returns {Promise<{jobId?: string, downloadUrl?: string}>}
    */
-  if (isMockMode()) {
-    const jobId = createJobId();
-    initMockJob(jobId);
-    const job = MOCK_JOBS.get(jobId);
-    job.payload = payload;
+  return withAutoMockFallback(
+    async () => submitGenerationReal(payload),
+    async () => {
+      const jobId = createJobId();
+      initMockJob(jobId);
+      const job = MOCK_JOBS.get(jobId);
+      job.payload = payload;
 
-    // small delay to mimic network
-    await sleep(250);
-    return { jobId };
-  }
-  return submitGenerationReal(payload);
+      // small delay to mimic network
+      await sleep(250);
+      return { jobId };
+    }
+  );
 }
 
 // PUBLIC_INTERFACE
@@ -290,9 +386,12 @@ export async function getStatus(jobId) {
    * @param {string} jobId
    * @returns {Promise<{status:'queued'|'processing'|'done'|'error', progress?:number, downloadUrl?:string, errorMessage?:string}>}
    */
-  if (isMockMode()) {
-    await sleep(180);
-    return computeMockStatus(jobId);
-  }
-  return getStatusReal(jobId);
+  return withAutoMockFallback(
+    async () => getStatusReal(jobId),
+    async () => {
+      await sleep(180);
+      return computeMockStatus(jobId);
+    }
+  );
 }
+

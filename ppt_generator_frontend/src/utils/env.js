@@ -1,5 +1,8 @@
 /**
  * Centralized env access for CRA. All values are read from process.env at build time.
+ *
+ * NOTE: A runtime "Force mock mode" override exists (stored in localStorage) in utils/mockMode.js.
+ * Keep env.js strictly build-time so behavior is predictable across deployments.
  */
 
 // PUBLIC_INTERFACE
